@@ -67,6 +67,23 @@ Python plugins should declare dependencies in `pyproject.toml` and commit the ge
 
 During the migration from `requirements.txt`, legacy plugins without `uv.lock` may keep using `requirements.txt`. CI/CD uses `uv.lock` first and falls back to `requirements.txt` only when no lock file is present.
 
+### Offline Package Build
+
+This fork keeps `langgenius/dify-official-plugins` as the `upstream` remote and builds self-contained `.difypkg` files for air-gapped Dify installations.
+
+To build a package manually, open **Actions → Build Offline Dify Plugins → Run workflow**, enter a plugin directory such as `models/openai`, and select the target Linux platform. The workflow first creates a normal package, then bundles Python wheel dependencies into an `*-offline-*.difypkg` artifact.
+
+Pushes to `main` that change a plugin also trigger the workflow automatically. The generated package is available from the workflow's **Artifacts** section for 30 days.
+
+To synchronize this fork with the official repository:
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+git push origin main
+```
+
 ### Security disclosure
 
 To protect your privacy, please avoid posting security issues on GitHub. Instead, send your questions to [security@dify.ai](mailto:security@dify.ai) and we will provide you with a more detailed answer.

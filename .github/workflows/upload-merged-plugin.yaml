@@ -1,6 +1,25 @@
-name: Upload Merged Plugin
+name: Build Offline Dify Plugins
 
 on:
+  workflow_dispatch:
+    inputs:
+      plugin_path:
+        description: "Plugin directory, for example models/openai"
+        required: true
+        type: string
+      python_platform:
+        description: "Target Python wheel platform"
+        required: true
+        default: manylinux2014_x86_64
+        type: choice
+        options:
+          - manylinux2014_x86_64
+          - manylinux2014_aarch64
+      allow_prerelease:
+        description: "Allow prerelease dependencies during resolution"
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - main
@@ -12,216 +31,218 @@ on:
       - "tools/**"
       - "triggers/**"
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  detect-changes:
-    runs-on: depot-ubuntu-24.04
-    permissions:
-      actions: read
-      contents: read
+  detect-plugins:
+    runs-on: ubuntu-latest
     outputs:
-      plugins: ${{ steps.filter.outputs.plugins }}
-      has_changes: ${{ steps.filter.outputs.has_changes }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - id: base-sha
-        name: Resolve base SHA from last successful run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_SHA: ${{ github.sha }}
-          CURRENT_RUN_NUMBER: ${{ github.run_number }}
-          FALLBACK_SHA: ${{ github.event.before }}
-        run: |
-          API_RESPONSE=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/upload-merged-plugin.yaml/runs?status=success&branch=${{ github.ref_name }}&per_page=10")
-
-          LAST_SUCCESS_SHA=$(echo "$API_RESPONSE" | jq -r \
-            --arg current "$CURRENT_SHA" \
-            --argjson run_number "$CURRENT_RUN_NUMBER" \
-            '[.workflow_runs[] | select(.head_sha != $current and .run_number < $run_number)] | max_by(.run_number) | .head_sha // empty')
-
-          if [ -n "$LAST_SUCCESS_SHA" ]; then
-            echo "base_sha=$LAST_SUCCESS_SHA" >> "$GITHUB_OUTPUT"
-            echo "Using last successful run SHA: $LAST_SUCCESS_SHA"
-          else
-            echo "base_sha=$FALLBACK_SHA" >> "$GITHUB_OUTPUT"
-            echo "No prior successful run found; falling back to github.event.before: $FALLBACK_SHA"
-          fi
-
-      - id: filter
-        name: Detect changed plugins
-        env:
-          BASE_SHA: ${{ steps.base-sha.outputs.base_sha }}
-          HEAD_SHA: ${{ github.sha }}
-        run: .github/scripts/detect-changed-plugins.sh
-
-  upload-merged-plugin:
-    permissions:
-      # contents: write is only what lets the failure report post a commit
-      # comment. The toolkit and the CLI are cloned with
-      # ORG_SCOPE_GITHUB_TOKEN, not with this token.
-      contents: write
-    needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
-    runs-on: depot-ubuntu-24.04-4
-    strategy:
-      matrix:
-        plugin_path: ${{ fromJson(needs.detect-changes.outputs.plugins) }}
-      fail-fast: false
-
+      plugins: ${{ steps.detect.outputs.plugins }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
           fetch-depth: 0
 
-      - name: Resolve external tool versions
-        id: external
+      - name: Detect requested or changed plugins
+        id: detect
         env:
-          GH_TOKEN: ${{ secrets.ORG_SCOPE_GITHUB_TOKEN }}
+          MANUAL_PLUGIN_PATH: ${{ inputs.plugin_path }}
+        shell: bash
         run: |
-          toolkit_sha=$(gh api repos/langgenius/dify-marketplace-toolkit/commits/HEAD --jq '.sha // empty')
-          cli_tag=$(gh release view -R langgenius/dify-plugin-daemon --json tagName --jq '.tagName // empty')
-          : "${toolkit_sha:?Marketplace toolkit commit is empty}" "${cli_tag:?Dify CLI release tag is empty}"
-          echo "toolkit_sha=$toolkit_sha" >> "$GITHUB_OUTPUT"
-          echo "cli_tag=$cli_tag" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Cache .scripts (toolkit + CLI)
-        id: scripts-cache
-        uses: actions/cache@v4
+          if [[ -n "${MANUAL_PLUGIN_PATH:-}" ]]; then
+            if [[ ! -f "$MANUAL_PLUGIN_PATH/manifest.yaml" ]]; then
+              echo "Plugin manifest not found: $MANUAL_PLUGIN_PATH/manifest.yaml" >&2
+              exit 1
+            fi
+            printf 'plugins=["%s"]\n' "$MANUAL_PLUGIN_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base_sha="${{ github.event.before }}"
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            base_sha="$(git rev-list --max-parents=0 HEAD)"
+          fi
+
+          mapfile -t changed_files < <(git diff --name-only "$base_sha" "$GITHUB_SHA" -- \
+            agent-strategies datasources extensions models tools triggers)
+
+          declare -A plugin_paths=()
+          for changed_file in "${changed_files[@]}"; do
+            candidate="${changed_file}"
+            while [[ "$candidate" == */* ]]; do
+              candidate="${candidate%/*}"
+              if [[ -f "$candidate/manifest.yaml" ]]; then
+                plugin_paths["$candidate"]=1
+                break
+              fi
+            done
+          done
+
+          if [[ ${#plugin_paths[@]} -eq 0 ]]; then
+            echo 'plugins=[]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${!plugin_paths[@]}" | sort | \
+            python3 -c 'import json, sys; print("plugins=" + json.dumps([x.strip() for x in sys.stdin if x.strip()]))' \
+            >> "$GITHUB_OUTPUT"
+
+  package-offline:
+    needs: detect-plugins
+    if: needs.detect-plugins.outputs.plugins != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin_path: ${{ fromJson(needs.detect-plugins.outputs.plugins) }}
+    steps:
+      - name: Checkout plugin source
+        uses: actions/checkout@v4
         with:
-          path: .scripts
-          key: scripts-${{ steps.external.outputs.toolkit_sha }}-${{ steps.external.outputs.cli_tag }}
+          fetch-depth: 0
 
-      - name: Clone Marketplace Toolkit
-        if: steps.scripts-cache.outputs.cache-hit != 'true'
+      - name: Set target platform variables
+        id: target
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.ORG_SCOPE_GITHUB_TOKEN }}
-          TOOLKIT_SHA: ${{ steps.external.outputs.toolkit_sha }}
+          INPUT_PLATFORM: ${{ inputs.python_platform }}
         run: |
-          rm -rf .scripts
-          gh repo clone langgenius/dify-marketplace-toolkit -- .scripts/
-          git -C .scripts checkout "$TOOLKIT_SHA"
+          set -euo pipefail
+          platform="${INPUT_PLATFORM:-manylinux2014_x86_64}"
+          case "$platform" in
+            manylinux2014_x86_64) suffix="offline-linux-amd64" ;;
+            manylinux2014_aarch64) suffix="offline-linux-arm64" ;;
+            *) echo "Unsupported platform: $platform" >&2; exit 1 ;;
+          esac
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.12.7
+          python-version: "3.12"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
-          version: "latest"
+          version: latest
           activate-environment: false
           enable-cache: true
           cache-dependency-glob: |
             ${{ matrix.plugin_path }}/uv.lock
             ${{ matrix.plugin_path }}/requirements.txt
 
-      - name: Download Dify CLI
-        if: steps.scripts-cache.outputs.cache-hit != 'true'
+      - name: Download Dify plugin CLI
         env:
-          GH_TOKEN: ${{ secrets.ORG_SCOPE_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release download "${{ steps.external.outputs.cli_tag }}" -R langgenius/dify-plugin-daemon --pattern "dify-plugin-linux-amd64" --dir .scripts
-          chmod +x .scripts/dify-plugin-linux-amd64
-          mv .scripts/dify-plugin-linux-amd64 .scripts/dify
+          set -euo pipefail
+          mkdir -p .tools
+          cli_tag="$(gh release view -R langgenius/dify-plugin-daemon --json tagName --jq '.tagName')"
+          gh release download "$cli_tag" -R langgenius/dify-plugin-daemon \
+            --pattern dify-plugin-linux-amd64 --dir .tools
+          chmod +x .tools/dify-plugin-linux-amd64
+          mv .tools/dify-plugin-linux-amd64 .tools/dify
 
-      - name: Validate Dependencies
+      - name: Download offline repackaging tool
+        shell: bash
         run: |
-          cd "${{ matrix.plugin_path }}"
+          set -euo pipefail
+          git clone --depth 1 https://github.com/risol/dify-plugin-repackaging.git .repackaging
+          git -C .repackaging fetch --depth 1 origin 3ed1ddce2c3963adc32e2788c3e584a58d45bdeb
+          git -C .repackaging checkout --detach 3ed1ddce2c3963adc32e2788c3e584a58d45bdeb
+          chmod +x .repackaging/plugin_repackaging.sh .repackaging/dify-plugin-linux-amd64
 
-          if [ -f "uv.lock" ]; then
-            VENV_DIR="$RUNNER_TEMP/plugin-dependency-check-venv"
-
-            cleanup() {
-              rm -rf "$VENV_DIR"
-            }
-            trap cleanup EXIT
-
-            rm -rf "$VENV_DIR"
-            UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --all-groups --frozen --python 3.12
-          elif [ -f "requirements.txt" ]; then
-            VENV_DIR=".ci-requirements-check-venv"
-
-            cleanup() {
-              rm -rf "$VENV_DIR"
-            }
-            trap cleanup EXIT
-
-            rm -rf "$VENV_DIR"
-            uv venv "$VENV_DIR" --python 3.12
-            uv pip install --python "$VENV_DIR/bin/python" -r requirements.txt
+      - name: Validate plugin dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin_path="${{ matrix.plugin_path }}"
+          if [[ -f "$plugin_path/uv.lock" ]]; then
+            UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/plugin-venv" \
+              uv sync --project "$plugin_path" --all-groups --frozen --python 3.12
+          elif [[ -f "$plugin_path/requirements.txt" ]]; then
+            uv venv "$RUNNER_TEMP/plugin-venv" --python 3.12
+            uv pip install --python "$RUNNER_TEMP/plugin-venv/bin/python" \
+              -r "$plugin_path/requirements.txt"
+          elif [[ -f "$plugin_path/pyproject.toml" ]]; then
+            UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/plugin-venv" \
+              uv sync --project "$plugin_path" --all-groups --python 3.12
           else
-            echo "!!! uv.lock or requirements.txt is required for dependency validation"
+            echo "No dependency manifest found in $plugin_path" >&2
             exit 1
           fi
 
-      - name: Generate Legacy Requirements for Packaging
-        run: |
-          bash .github/scripts/export-legacy-requirements.sh "${{ matrix.plugin_path }}"
+      - name: Generate package requirements
+        shell: bash
+        run: bash .github/scripts/export-legacy-requirements.sh "${{ matrix.plugin_path }}"
 
-      - name: Extract Release Notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PLUGIN_PATH: ${{ matrix.plugin_path }}
+      - name: Build base difypkg
+        id: base-package
+        shell: bash
         run: |
-          LAST_SHA=$(git log -1 --format=%H -- "$PLUGIN_PATH")
-          PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/$LAST_SHA/pulls" --jq '.[0].number // empty' || true)
-          if [ -n "$PR_NUMBER" ]; then
-            gh pr view "$PR_NUMBER" -R "${{ github.repository }}" --json body --jq .body > /tmp/pr_body.md
-          else
-            echo "No associated PR found for $LAST_SHA; uploading without release notes."
-            : > /tmp/pr_body.md
+          set -euo pipefail
+          plugin_path="${{ matrix.plugin_path }}"
+          safe_path="${plugin_path//\//-}"
+          raw_package="$RUNNER_TEMP/${safe_path}.difypkg"
+          .tools/dify plugin package "$plugin_path" --output_path "$raw_package"
+          echo "raw_package=$raw_package" >> "$GITHUB_OUTPUT"
+
+      - name: Repackage with bundled wheels
+        id: offline-package
+        shell: bash
+        env:
+          RAW_PACKAGE: ${{ steps.base-package.outputs.raw_package }}
+          TARGET_PLATFORM: ${{ steps.target.outputs.platform }}
+          PACKAGE_SUFFIX: ${{ steps.target.outputs.suffix }}
+        run: |
+          set -euo pipefail
+          package_file="$(basename "$RAW_PACKAGE")"
+          package_base="${package_file%.difypkg}"
+          cp "$RAW_PACKAGE" ".repackaging/$package_file"
+          extra_args=()
+          if [[ "${{ inputs.allow_prerelease }}" == "true" ]]; then
+            extra_args+=("-R")
           fi
-          python3 .scripts/tools/extract-changelog.py --pr-body-file /tmp/pr_body.md --section "Release Notes" > /tmp/changelog.md
-          echo "--- extracted release notes ---"
-          cat /tmp/changelog.md
+          (
+            cd .repackaging
+            ./plugin_repackaging.sh -p "$TARGET_PLATFORM" -s "$PACKAGE_SUFFIX" \
+              "${extra_args[@]}" local "./$package_file"
+          )
+          output=".repackaging/${package_base}-${PACKAGE_SUFFIX}.difypkg"
+          test -s "$output"
+          mkdir -p dist
+          mv "$output" "dist/$(basename "$output")"
+          echo "package=dist/$(basename "$output")" >> "$GITHUB_OUTPUT"
+          echo "package_name=$(basename "$output")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Plugin (production)
-        run: |
-          uv run --with requests --with dify_plugin python .scripts/uploader -d "${{ matrix.plugin_path }}" -t "${{ secrets.MARKETPLACE_TOKEN }}" --plugin-daemon-path .scripts/dify -u "${{ secrets.MARKETPLACE_BASE_URL }}" -f --with-changelog < /tmp/changelog.md
+      - name: Upload offline package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.offline-package.outputs.package_name }}
+          path: ${{ steps.offline-package.outputs.package }}
+          if-no-files-found: error
+          retention-days: 30
 
-      # Staging only becomes testable once uploads reach it: the backend rebuilds
-      # latest/recommended on an upload signal. Never blocking, though -- a red run
-      # invites a re-run, which re-uploads; -f keeps that idempotent.
-      - name: Upload Plugin (staging)
-        id: upload-staging
-        continue-on-error: true
+      - name: Write summary
+        shell: bash
         env:
-          PLUGIN_PATH: ${{ matrix.plugin_path }}
-          STAGING_BASE_URL: ${{ secrets.MARKETPLACE_STAGING_BASE_URL }}
-          STAGING_TOKEN: ${{ secrets.MARKETPLACE_STAGING_TOKEN }}
+          PACKAGE: ${{ steps.offline-package.outputs.package }}
         run: |
-          if [ -z "$STAGING_BASE_URL" ] || [ -z "$STAGING_TOKEN" ]; then
-            echo "MARKETPLACE_STAGING_BASE_URL / _TOKEN are not set; skipping the staging upload"
-            exit 0
-          fi
-          uv run --with requests --with dify_plugin python .scripts/uploader -d "$PLUGIN_PATH" -t "$STAGING_TOKEN" \
-            --plugin-daemon-path .scripts/dify -u "$STAGING_BASE_URL" -f --with-changelog < /tmp/changelog.md
-
-      - name: Report a failed staging upload
-        if: steps.upload-staging.outcome == 'failure'
-        # Summary needs no token; the comment is best-effort. Neither may redden
-        # a production publish that already succeeded.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PLUGIN: ${{ matrix.plugin_path }}
-        run: |
-          report=$(printf '%s\n' \
-            "**Staging upload failed** for \`$PLUGIN\`." \
-            "" \
-            "The plugin **is** published to production -- only <https://marketplace-staging.dify.dev> is missing it, so nothing needs re-merging or re-reviewing." \
-            "" \
-            "Reason: [workflow run]($RUN_URL). The next push of this plugin, or a backfill run, will bring staging back in line.")
-          printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
-          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" -f body="$report"
+          {
+            echo "## Offline Dify plugin package"
+            echo
+            echo "- Plugin: \`${{ matrix.plugin_path }}\`"
+            echo "- Target: \`${{ steps.target.outputs.platform }}\`"
+            echo "- Package: \`$PACKAGE\`"
+            echo "- Dependencies: bundled as wheels"
+          } >> "$GITHUB_STEP_SUMMARY"
