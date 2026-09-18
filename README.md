@@ -71,9 +71,9 @@ During the migration from `requirements.txt`, legacy plugins without `uv.lock` m
 
 This fork keeps `langgenius/dify-official-plugins` as the `upstream` remote and builds self-contained `.difypkg` files for air-gapped Dify installations.
 
-To build a package manually, open **Actions → Build Offline Dify Plugins → Run workflow**, enter a plugin directory such as `models/openai`, and select the target Linux platform. The workflow first creates a normal package, then bundles Python wheel dependencies into an `*-offline-*.difypkg` artifact.
+To build a package manually, open **Actions → Build Offline Dify Plugins → Run workflow**, enter a plugin directory such as `models/openai`, and select the target Linux platform. The workflow first creates a normal package, then bundles Python wheel dependencies into an `*-offline-*.difypkg` file and publishes it to a GitHub Release.
 
-Pushes to `main` that change a plugin also trigger the workflow automatically. The generated package is available from the workflow's **Artifacts** section for 30 days.
+Pushes to `main` that change a plugin also trigger the workflow automatically. Release tags use the format `<author>-<plugin>-v<version>-offline-linux-amd64` or `offline-linux-arm64`. Re-running the same build replaces the existing release asset.
 
 To synchronize this fork with the official repository:
 

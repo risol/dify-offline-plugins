@@ -32,7 +32,7 @@ on:
       - "triggers/**"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -225,13 +225,43 @@ jobs:
           echo "package=dist/$(basename "$output")" >> "$GITHUB_OUTPUT"
           echo "package_name=$(basename "$output")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload offline package
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.offline-package.outputs.package_name }}
-          path: ${{ steps.offline-package.outputs.package }}
-          if-no-files-found: error
-          retention-days: 30
+      - name: Publish package to GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ steps.offline-package.outputs.package }}
+          PACKAGE_NAME: ${{ steps.offline-package.outputs.package_name }}
+          PACKAGE_SUFFIX: ${{ steps.target.outputs.suffix }}
+          PLUGIN_PATH: ${{ matrix.plugin_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin_author="$(awk -F': *' '/^author:/ {gsub(/["\047]/, "", $2); print $2; exit}' "$PLUGIN_PATH/manifest.yaml")"
+          plugin_name="$(awk -F': *' '/^name:/ {gsub(/["\047]/, "", $2); print $2; exit}' "$PLUGIN_PATH/manifest.yaml")"
+          plugin_version="$(awk -F': *' '/^version:/ {gsub(/["\047]/, "", $2); print $2; exit}' "$PLUGIN_PATH/manifest.yaml")"
+          : "${plugin_author:?author is missing from manifest.yaml}" \
+            "${plugin_name:?name is missing from manifest.yaml}" \
+            "${plugin_version:?version is missing from manifest.yaml}"
+
+          tag="${plugin_author}-${plugin_name}-v${plugin_version}-${PACKAGE_SUFFIX}"
+          title="${plugin_author}/${plugin_name} ${plugin_version} (${PACKAGE_SUFFIX})"
+          notes="Self-contained offline Dify plugin package.\n\n- Plugin: ${plugin_author}/${plugin_name}\n- Version: ${plugin_version}\n- Target: ${PACKAGE_SUFFIX}\n- Source commit: ${GITHUB_SHA}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$PACKAGE" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$PACKAGE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --latest=false
+          fi
+
+          release_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "url=$release_url" >> "$GITHUB_OUTPUT"
+          echo "Published $PACKAGE_NAME to $release_url"
 
       - name: Write summary
         shell: bash
@@ -244,5 +274,6 @@ jobs:
             echo "- Plugin: \`${{ matrix.plugin_path }}\`"
             echo "- Target: \`${{ steps.target.outputs.platform }}\`"
             echo "- Package: \`$PACKAGE\`"
+            echo "- Release: [${{ steps.release.outputs.tag }}](${{ steps.release.outputs.url }})"
             echo "- Dependencies: bundled as wheels"
           } >> "$GITHUB_STEP_SUMMARY"
